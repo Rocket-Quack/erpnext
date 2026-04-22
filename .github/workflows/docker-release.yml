@@ -1,18 +1,194 @@
-name: Trigger Docker build on release
+name: Build and Publish Docker Images
+
 on:
   release:
     types: [released]
+  workflow_dispatch:
+    inputs:
+      app_ref:
+        description: Git tag or branch to build
+        required: false
+        type: string
+      image_tag:
+        description: Override the published image tag
+        required: false
+        type: string
+      frappe_ref:
+        description: Override the base Frappe image tag, for example version-16
+        required: false
+        type: string
+      push:
+        description: Push the built images to registries
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
+  packages: write
+
+concurrency:
+  group: docker-image-${{ github.event.release.tag_name || github.event.inputs.app_ref || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  curl:
+  prepare:
+    name: Resolve Build Metadata
     runs-on: ubuntu-latest
-    container:
-      image: alpine:latest
+    outputs:
+      app_ref: ${{ steps.meta.outputs.app_ref }}
+      app_repo: ${{ steps.meta.outputs.app_repo }}
+      frappe_ref: ${{ steps.meta.outputs.frappe_ref }}
+      ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
+      dockerhub_image: ${{ steps.meta.outputs.dockerhub_image }}
+      image_tags: ${{ steps.meta.outputs.image_tags }}
+      push: ${{ steps.meta.outputs.push }}
     steps:
-    - name: curl
-      run: |
-        apk add curl bash
-        curl -X POST -H "Accept: application/vnd.github.v3+json" -H "Authorization: Bearer ${{ secrets.CI_PAT }}" https://api.github.com/repos/frappe/frappe_docker/actions/workflows/build_stable.yml/dispatches -d '{"ref":"main"}'
+      - name: Resolve metadata
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_APP_REF: ${{ github.event.inputs.app_ref }}
+          INPUT_IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          INPUT_FRAPPE_REF: ${{ github.event.inputs.frappe_ref }}
+          INPUT_PUSH: ${{ github.event.inputs.push }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          app_ref="${INPUT_APP_REF:-}"
+          if [ -z "$app_ref" ]; then
+            if [ "$EVENT_NAME" = "release" ] && [ -n "${RELEASE_TAG:-}" ]; then
+              app_ref="$RELEASE_TAG"
+            else
+              app_ref="${GITHUB_REF_NAME}"
+            fi
+          fi
+
+          push="${INPUT_PUSH:-true}"
+          if [ "$EVENT_NAME" = "release" ]; then
+            push="true"
+          fi
+
+          frappe_ref="${INPUT_FRAPPE_REF:-}"
+          major=""
+          if [ -z "$frappe_ref" ]; then
+            if [[ "$app_ref" =~ ^v([0-9]+)([.].*)?$ ]]; then
+              major="${BASH_REMATCH[1]}"
+              frappe_ref="version-${major}"
+            elif [[ "$app_ref" =~ ^version-([0-9]+)$ ]]; then
+              major="${BASH_REMATCH[1]}"
+              frappe_ref="$app_ref"
+            elif [ "$app_ref" = "develop" ]; then
+              frappe_ref="develop"
+            else
+              echo "::error::Unable to derive frappe_ref from app_ref '$app_ref'. Provide the workflow_dispatch input 'frappe_ref'."
+              exit 1
+            fi
+          elif [[ "$frappe_ref" =~ ^version-([0-9]+)$ ]]; then
+            major="${BASH_REMATCH[1]}"
+          fi
+
+          declare -a tags
+          if [ -n "${INPUT_IMAGE_TAG:-}" ]; then
+            tags=("$INPUT_IMAGE_TAG")
+          elif [[ "$app_ref" =~ ^v([0-9]+)([.].*)?$ ]]; then
+            major="${BASH_REMATCH[1]}"
+            tags=("$app_ref" "v${major}" "version-${major}")
+          elif [ "$app_ref" = "develop" ]; then
+            tags=("develop" "latest")
+          else
+            tags=("$app_ref")
+          fi
+
+          declare -A seen
+          image_tags="["
+          for tag in "${tags[@]}"; do
+            if [ -z "$tag" ] || [ -n "${seen[$tag]+x}" ]; then
+              continue
+            fi
+            seen[$tag]=1
+            image_tags="${image_tags}\"${tag}\","
+          done
+          image_tags="${image_tags%,}]"
+
+          if [ "$image_tags" = "]" ]; then
+            echo "::error::No image tags were resolved."
+            exit 1
+          fi
+
+          owner_lower="$(echo "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          dockerhub_image="$(echo "${DOCKERHUB_IMAGE:-}" | tr '[:upper:]' '[:lower:]')"
+
+          {
+            echo "app_ref=$app_ref"
+            echo "app_repo=https://github.com/$REPOSITORY"
+            echo "frappe_ref=$frappe_ref"
+            echo "ghcr_image=ghcr.io/$owner_lower/erpnext"
+            echo "dockerhub_image=$dockerhub_image"
+            echo "image_tags=$image_tags"
+            echo "push=$push"
+          } >> "$GITHUB_OUTPUT"
+
+  validate-dockerhub:
+    name: Validate Docker Hub Configuration
+    needs: prepare
+    if: ${{ needs.prepare.outputs.push == 'true' && needs.prepare.outputs.dockerhub_image != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required secrets
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${DOCKERHUB_USERNAME:-}" || { echo "::error::Missing secret DOCKERHUB_USERNAME."; exit 1; }
+          test -n "${DOCKERHUB_TOKEN:-}" || { echo "::error::Missing secret DOCKERHUB_TOKEN."; exit 1; }
+
+  publish-ghcr:
+    name: Publish GHCR
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        image_tag: ${{ fromJSON(needs.prepare.outputs.image_tags) }}
+    uses: frappe/frappe_docker/.github/workflows/app-build-image.yml@main
+    with:
+      app_name: erpnext
+      app_repo: ${{ needs.prepare.outputs.app_repo }}
+      app_ref: ${{ needs.prepare.outputs.app_ref }}
+      frappe_ref: ${{ needs.prepare.outputs.frappe_ref }}
+      image_name: ${{ needs.prepare.outputs.ghcr_image }}
+      image_tag: ${{ matrix.image_tag }}
+      push: ${{ needs.prepare.outputs.push == 'true' }}
+      registry: ghcr.io
+      platforms: linux/amd64,linux/arm64
+
+  publish-dockerhub:
+    name: Publish Docker Hub
+    needs:
+      - prepare
+      - validate-dockerhub
+    if: ${{ needs.prepare.outputs.push == 'true' && needs.prepare.outputs.dockerhub_image != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image_tag: ${{ fromJSON(needs.prepare.outputs.image_tags) }}
+    uses: frappe/frappe_docker/.github/workflows/app-build-image.yml@main
+    with:
+      app_name: erpnext
+      app_repo: ${{ needs.prepare.outputs.app_repo }}
+      app_ref: ${{ needs.prepare.outputs.app_ref }}
+      frappe_ref: ${{ needs.prepare.outputs.frappe_ref }}
+      image_name: ${{ needs.prepare.outputs.dockerhub_image }}
+      image_tag: ${{ matrix.image_tag }}
+      push: true
+      platforms: linux/amd64,linux/arm64
+    secrets:
+      REGISTRY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
